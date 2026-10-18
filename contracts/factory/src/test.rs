@@ -372,6 +372,64 @@ fn create_group_rejects_invalid_parameters() {
 }
 
 #[test]
+fn create_group_prioritizes_capacity_and_frequency_validation_over_overflow() {
+    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let creator = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Out-of-range capacity (0, 1, MAX_MEMBERS+1, u32::MAX) with overflowing or non-positive amount
+    // must return InvalidMemberCapacity, not InvalidContributionAmount.
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity)),
+        "zero capacity must return InvalidMemberCapacity even if contribution_amount overflows"
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &0i128, &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity)),
+        "zero capacity must return InvalidMemberCapacity even if contribution_amount is zero"
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &(-5i128), &0u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity)),
+        "zero capacity must return InvalidMemberCapacity even if contribution_amount is negative"
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &1u32, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity)),
+        "capacity < MIN_MEMBERS must return InvalidMemberCapacity even if contribution_amount overflows"
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &(MAX_MEMBERS + 1), &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity)),
+        "capacity > MAX_MEMBERS must return InvalidMemberCapacity even if contribution_amount overflows"
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &u32::MAX, &604_800u64),
+        Err(Ok(FactoryError::InvalidMemberCapacity)),
+        "u32::MAX capacity must return InvalidMemberCapacity even if contribution_amount overflows"
+    );
+
+    // Zero frequency with overflowing or non-positive contribution amount
+    // must return InvalidFrequency, not InvalidContributionAmount.
+    assert_eq!(
+        client.try_create_group(&creator, &token, &i128::MAX, &5u32, &0u64),
+        Err(Ok(FactoryError::InvalidFrequency)),
+        "zero frequency must return InvalidFrequency even if contribution_amount overflows"
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &0i128, &5u32, &0u64),
+        Err(Ok(FactoryError::InvalidFrequency)),
+        "zero frequency must return InvalidFrequency even if contribution_amount is zero"
+    );
+    assert_eq!(
+        client.try_create_group(&creator, &token, &(-10i128), &5u32, &0u64),
+        Err(Ok(FactoryError::InvalidFrequency)),
+        "zero frequency must return InvalidFrequency even if contribution_amount is negative"
+    );
+}
+
+#[test]
 fn create_group_is_refused_while_paused() {
     let (env, _, _, client) = setup(MAX_FEE_BPS);
     let creator = Address::generate(&env);
