@@ -74,7 +74,11 @@ fn set_fee_updates_future_groups_within_the_cap() {
     let emitted = env.events().all().filter_by_contract(&client.address);
 
     assert_eq!(client.get_config().fee_bps, 10);
-    let expected = FeeUpdated { fee_bps: 10 }.to_xdr(&env, &client.address);
+    let expected = FeeUpdated {
+        previous_fee_bps: MAX_FEE_BPS,
+        fee_bps: 10,
+    }
+    .to_xdr(&env, &client.address);
     assert!(emitted.events().contains(&expected));
 }
 
@@ -120,7 +124,7 @@ fn set_fee_requires_admin_authorization() {
 
 #[test]
 fn set_treasury_updates_future_groups() {
-    let (env, _, _, client) = setup(MAX_FEE_BPS);
+    let (env, _, treasury, client) = setup(MAX_FEE_BPS);
     let new_treasury = Address::generate(&env);
 
     client.set_treasury(&new_treasury);
@@ -128,6 +132,7 @@ fn set_treasury_updates_future_groups() {
 
     assert_eq!(client.get_config().treasury, new_treasury);
     let expected = TreasuryUpdated {
+        previous_treasury: treasury,
         treasury: new_treasury,
     }
     .to_xdr(&env, &client.address);
@@ -141,6 +146,101 @@ fn set_treasury_requires_admin_authorization() {
     let new_treasury = Address::generate(&env);
 
     assert!(client.try_set_treasury(&new_treasury).is_err());
+}
+
+#[test]
+fn set_fee_sequence_tracks_previous_values_accurately() {
+    let (env, _, _, client) = setup(50);
+
+    // 50 -> 30
+    client.set_fee(&30u32);
+    let event1 = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(client.get_config().fee_bps, 30);
+    assert!(event1.events().contains(
+        &FeeUpdated {
+            previous_fee_bps: 50,
+            fee_bps: 30,
+        }
+        .to_xdr(&env, &client.address)
+    ));
+
+    // 30 -> 15
+    client.set_fee(&15u32);
+    let event2 = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(client.get_config().fee_bps, 15);
+    assert!(event2.events().contains(
+        &FeeUpdated {
+            previous_fee_bps: 30,
+            fee_bps: 15,
+        }
+        .to_xdr(&env, &client.address)
+    ));
+
+    // 15 -> 1
+    client.set_fee(&1u32);
+    let event3 = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(client.get_config().fee_bps, 1);
+    assert!(event3.events().contains(
+        &FeeUpdated {
+            previous_fee_bps: 15,
+            fee_bps: 1,
+        }
+        .to_xdr(&env, &client.address)
+    ));
+}
+
+#[test]
+fn set_treasury_sequence_tracks_previous_values_accurately() {
+    let (env, _, treasury0, client) = setup(MAX_FEE_BPS);
+    let treasury1 = Address::generate(&env);
+    let treasury2 = Address::generate(&env);
+
+    // T0 -> T1
+    client.set_treasury(&treasury1);
+    let event1 = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(client.get_config().treasury, treasury1);
+    assert!(event1.events().contains(
+        &TreasuryUpdated {
+            previous_treasury: treasury0,
+            treasury: treasury1.clone(),
+        }
+        .to_xdr(&env, &client.address)
+    ));
+
+    // T1 -> T2
+    client.set_treasury(&treasury2);
+    let event2 = env.events().all().filter_by_contract(&client.address);
+    assert_eq!(client.get_config().treasury, treasury2);
+    assert!(event2.events().contains(
+        &TreasuryUpdated {
+            previous_treasury: treasury1,
+            treasury: treasury2,
+        }
+        .to_xdr(&env, &client.address)
+    ));
+}
+
+#[test]
+fn rejected_fee_and_treasury_changes_emit_no_events() {
+    let (env, admin, _, client) = setup(MAX_FEE_BPS);
+
+    // Rejected fee update (> MAX_FEE_BPS or 0)
+    assert!(client.try_set_fee(&(MAX_FEE_BPS + 10)).is_err());
+    assert!(client.try_set_fee(&0u32).is_err());
+    let fee_events = env.events().all().filter_by_contract(&client.address);
+    assert!(
+        fee_events.events().is_empty(),
+        "failed fee updates must not emit FeeUpdated events"
+    );
+
+    // Rejected treasury update (admin as treasury or contract as treasury)
+    assert!(client.try_set_treasury(&admin).is_err());
+    assert!(client.try_set_treasury(&client.address).is_err());
+    let treasury_events = env.events().all().filter_by_contract(&client.address);
+    assert!(
+        treasury_events.events().is_empty(),
+        "failed treasury updates must not emit TreasuryUpdated events"
+    );
 }
 
 // ---------------------------------------------------------------------------
