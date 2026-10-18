@@ -1326,6 +1326,80 @@ fn get_round_reports_an_unstarted_round_safely() {
 }
 
 #[test]
+fn get_round_reports_no_recipient_for_unstarted_and_future_rounds() {
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    // 1. Unstarted group with members joined: current_round is 0.
+    // Even though members exist at MemberAt(1..=3), no round has started yet,
+    // so get_round must report recipient: None for all rounds (#39).
+    setup.join_all();
+    assert_eq!(client.get_current_round(), 0);
+    assert_eq!(client.get_round(&0u32).recipient, None);
+    assert_eq!(client.get_round(&1u32).recipient, None);
+    assert_eq!(client.get_round(&2u32).recipient, None);
+    assert_eq!(client.get_round(&3u32).recipient, None);
+    assert_eq!(client.get_round(&4u32).recipient, None);
+
+    // 2. Start group: round 1 becomes active.
+    client.start();
+    assert_eq!(client.get_current_round(), 1);
+    assert_eq!(client.get_round(&0u32).recipient, None);
+    assert_eq!(client.get_round(&1u32).recipient, Some(setup.member(0)));
+    assert_eq!(
+        client.get_round(&2u32).recipient,
+        None,
+        "future round 2 must have no recipient yet"
+    );
+    assert_eq!(
+        client.get_round(&3u32).recipient,
+        None,
+        "future round 3 must have no recipient yet"
+    );
+
+    // 3. Complete round 1: round 1 is past/paid, round 2 becomes active.
+    setup.contribute_all(1);
+    client.execute_payout();
+    assert_eq!(client.get_current_round(), 2);
+    let past_round_1 = client.get_round(&1u32);
+    assert!(past_round_1.payout_executed);
+    assert_eq!(
+        past_round_1.recipient,
+        Some(setup.member(0)),
+        "completed round must retain its recipient"
+    );
+    let active_round_2 = client.get_round(&2u32);
+    assert!(!active_round_2.payout_executed);
+    assert_eq!(
+        active_round_2.recipient,
+        Some(setup.member(1)),
+        "current round must report recipient"
+    );
+    assert_eq!(
+        client.get_round(&3u32).recipient,
+        None,
+        "future round 3 must still have no recipient"
+    );
+
+    // 4. Complete round 2: round 3 becomes active.
+    setup.contribute_all(2);
+    client.execute_payout();
+    assert_eq!(client.get_current_round(), 3);
+    assert_eq!(client.get_round(&1u32).recipient, Some(setup.member(0)));
+    assert_eq!(client.get_round(&2u32).recipient, Some(setup.member(1)));
+    assert_eq!(client.get_round(&3u32).recipient, Some(setup.member(2)));
+
+    // 5. Complete final round 3: terminal completed state.
+    setup.contribute_all(3);
+    client.execute_payout();
+    assert_eq!(client.get_status(), Status::Completed);
+    assert_eq!(client.get_round(&1u32).recipient, Some(setup.member(0)));
+    assert_eq!(client.get_round(&2u32).recipient, Some(setup.member(1)));
+    assert_eq!(client.get_round(&3u32).recipient, Some(setup.member(2)));
+    assert_eq!(client.get_round(&4u32).recipient, None);
+}
+
+#[test]
 fn get_pool_balance_is_zero_before_the_group_starts() {
     let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
     assert_eq!(setup.client().get_pool_balance(), 0);
