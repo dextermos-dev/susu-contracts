@@ -1437,3 +1437,66 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         Err(Ok(GroupError::ArithmeticOverflow))
     );
 }
+
+#[test]
+fn get_payout_order_fails_loudly_when_middle_member_position_is_missing() {
+    let setup = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+
+    assert_eq!(client.get_payout_order().len(), 3);
+
+    // Simulate an archived / missing MemberAt persistent entry at position 2
+    setup.env.as_contract(&setup.group_id, || {
+        setup
+            .env
+            .storage()
+            .persistent()
+            .remove(&DataKey::MemberAt(2u32));
+    });
+
+    // Must return PayoutOrderIncomplete rather than silently returning a shortened Vec (#41)
+    assert_eq!(
+        client.try_get_payout_order(),
+        Err(Ok(GroupError::PayoutOrderIncomplete))
+    );
+}
+
+#[test]
+fn get_payout_order_fails_loudly_when_first_or_last_position_is_missing() {
+    // 1. Missing first position (position 1)
+    let setup1 = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client1 = setup1.client();
+    setup1.env.as_contract(&setup1.group_id, || {
+        setup1
+            .env
+            .storage()
+            .persistent()
+            .remove(&DataKey::MemberAt(1u32));
+    });
+    assert_eq!(
+        client1.try_get_payout_order(),
+        Err(Ok(GroupError::PayoutOrderIncomplete))
+    );
+
+    // 2. Missing last position (position 3)
+    let setup2 = setup_started(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client2 = setup2.client();
+    setup2.env.as_contract(&setup2.group_id, || {
+        setup2
+            .env
+            .storage()
+            .persistent()
+            .remove(&DataKey::MemberAt(3u32));
+    });
+    assert_eq!(
+        client2.try_get_payout_order(),
+        Err(Ok(GroupError::PayoutOrderIncomplete))
+    );
+}
+
+#[test]
+fn get_payout_order_returns_empty_vector_when_no_members_joined() {
+    let setup = setup(3, 10 * ONE_USDC, MAX_FEE_BPS);
+    let client = setup.client();
+    assert_eq!(client.get_payout_order().len(), 0);
+}
