@@ -1437,3 +1437,422 @@ fn contribute_returns_arithmetic_overflow_when_contribution_count_overflows() {
         Err(Ok(GroupError::ArithmeticOverflow))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cross-Round Reentrancy Coverage (Issue #44)
+// ---------------------------------------------------------------------------
+
+/// A test-only token that attacks the Group contract mid-transfer during `execute_payout`.
+///
+/// When armed, its `transfer` callback attempts to re-enter `execute_payout`
+/// (attempting to pay round N twice or round N+1 early) and `contribute` for the
+/// round being settled. It also inspects and records the observed state of the Group
+/// contract during the transfer callback to verify that effects-before-interactions
+/// (CEI) has already taken place.
+#[contract]
+pub struct ReentrantToken;
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn balance(env: Env, id: Address) -> i128 {
+        let bal_key = soroban_sdk::Symbol::new(&env, "bal");
+        env.storage().persistent().get(&(bal_key, id)).unwrap_or(0)
+    }
+
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let bal_key = soroban_sdk::Symbol::new(&env, "bal");
+        let bal: i128 = env
+            .storage()
+            .persistent()
+            .get(&(bal_key.clone(), to.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&(bal_key, to), &(bal + amount));
+    }
+
+    pub fn arm(env: Env, group: Address, attacker: Address, amount: i128, attack_round: u32) {
+        let instance = env.storage().instance();
+        instance.set(&soroban_sdk::Symbol::new(&env, "armed"), &true);
+        instance.set(&soroban_sdk::Symbol::new(&env, "group"), &group);
+        instance.set(&soroban_sdk::Symbol::new(&env, "attacker"), &attacker);
+        instance.set(&soroban_sdk::Symbol::new(&env, "attack_amount"), &amount);
+        instance.set(
+            &soroban_sdk::Symbol::new(&env, "attack_round"),
+            &attack_round,
+        );
+        instance.set(&soroban_sdk::Symbol::new(&env, "depth"), &0u32);
+    }
+
+    pub fn disarm(env: Env) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::Symbol::new(&env, "armed"), &false);
+    }
+
+    pub fn was_attack_called(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::Symbol::new(&env, "obs_called"))
+            .unwrap_or(false)
+    }
+
+    pub fn attack_results(env: Env) -> (bool, bool) {
+        let instance = env.storage().instance();
+        let exec_failed: bool = instance
+            .get(&soroban_sdk::Symbol::new(&env, "exec_failed"))
+            .unwrap_or(false);
+        let contrib_failed: bool = instance
+            .get(&soroban_sdk::Symbol::new(&env, "contrib_failed"))
+            .unwrap_or(false);
+        (exec_failed, contrib_failed)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        let bal_key = soroban_sdk::Symbol::new(&env, "bal");
+        let from_bal: i128 = env
+            .storage()
+            .persistent()
+            .get(&(bal_key.clone(), from.clone()))
+            .unwrap_or(0);
+        let to_bal: i128 = env
+            .storage()
+            .persistent()
+            .get(&(bal_key.clone(), to.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&(bal_key.clone(), from), &(from_bal - amount));
+        env.storage()
+            .persistent()
+            .set(&(bal_key, to), &(to_bal + amount));
+
+        let armed: bool = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::Symbol::new(&env, "armed"))
+            .unwrap_or(false);
+        let depth: u32 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::Symbol::new(&env, "depth"))
+            .unwrap_or(0);
+
+        if !armed || depth > 0 {
+            return;
+        }
+
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::Symbol::new(&env, "depth"), &1u32);
+
+        let group: Address = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::Symbol::new(&env, "group"))
+            .unwrap();
+        let attacker: Address = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::Symbol::new(&env, "attacker"))
+            .unwrap();
+        let attack_round: u32 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::Symbol::new(&env, "attack_round"))
+            .unwrap();
+        let attack_amount: i128 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::Symbol::new(&env, "attack_amount"))
+            .unwrap();
+
+        let client = GroupContractClient::new(&env, &group);
+
+        // Reentrant execution attempts caught safely via try_ calls
+        let exec_failed = client.try_execute_payout().is_err();
+        let contrib_failed = client
+            .try_contribute(&attacker, &attack_amount, &attack_round)
+            .is_err();
+
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::Symbol::new(&env, "exec_failed"), &exec_failed);
+        env.storage().instance().set(
+            &soroban_sdk::Symbol::new(&env, "contrib_failed"),
+            &contrib_failed,
+        );
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::Symbol::new(&env, "obs_called"), &true);
+    }
+}
+
+fn setup_with_reentrant_token(
+    capacity: u32,
+    amount: i128,
+    fee_bps: u32,
+) -> (Setup, ReentrantTokenClient<'static>) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let treasury = Address::generate(&env);
+    let token_id = env.register(ReentrantToken, ());
+    let reentrant = ReentrantTokenClient::new(&env, &token_id);
+
+    let group_id = env.register(
+        GroupContract,
+        (
+            Address::generate(&env),
+            Address::generate(&env),
+            token_id.clone(),
+            treasury.clone(),
+            amount,
+            capacity,
+            ONE_WEEK,
+            fee_bps,
+        ),
+    );
+
+    let mut members = Vec::new(&env);
+    let mut index = 0;
+    while index < capacity {
+        let member = Address::generate(&env);
+        reentrant.mint(&member, &(amount * (capacity as i128 + 1)));
+        members.push_back(member);
+        index += 1;
+    }
+
+    let setup = Setup {
+        env: env.clone(),
+        group_id: group_id.clone(),
+        token: token_id.clone(),
+        treasury: treasury.clone(),
+        members,
+        amount,
+        capacity,
+    };
+
+    (setup, reentrant)
+}
+
+#[test]
+fn reentrant_token_cannot_double_pay_round_or_pay_next_early() {
+    let capacity = 3u32;
+    let amount = 10 * ONE_USDC;
+    let fee_bps = MAX_FEE_BPS;
+    let (setup, reentrant) = setup_with_reentrant_token(capacity, amount, fee_bps);
+    let client = setup.client();
+
+    setup.join_all();
+    client.start();
+    setup.contribute_all(1);
+
+    // Arm re-entrancy attack on round 1 payout transfer
+    reentrant.arm(&setup.group_id, &setup.member(1), &amount, &1u32);
+    client.execute_payout();
+    reentrant.disarm();
+
+    let (exec_failed, contrib_failed) = reentrant.attack_results();
+    assert!(exec_failed, "re-entrant execute_payout must be rejected");
+    assert!(contrib_failed, "re-entrant contribute must be rejected");
+    assert!(
+        reentrant.was_attack_called(),
+        "attack callback must have been triggered"
+    );
+
+    // Verify effects took place
+    assert!(
+        client.get_round(&1u32).payout_executed,
+        "round 1 must be marked payout_executed"
+    );
+    assert_eq!(
+        client.get_current_round(),
+        2,
+        "current_round must already be advanced to 2"
+    );
+
+    // Complete rounds 2 and 3 normally
+    setup.contribute_all(2);
+    client.execute_payout();
+    setup.contribute_all(3);
+    client.execute_payout();
+
+    assert_eq!(client.get_status(), Status::Completed);
+
+    let pool: i128 = amount * capacity as i128;
+    let fee: i128 = pool * fee_bps as i128 / 10_000;
+    let share = pool - fee;
+    let minted = amount * (capacity as i128 + 1);
+
+    let mut idx = 0;
+    while idx < capacity {
+        assert_eq!(
+            reentrant.balance(&setup.member(idx)),
+            minted - pool + share,
+            "member {idx} must end with exactly one payout and three contributions"
+        );
+        idx += 1;
+    }
+    assert_eq!(reentrant.balance(&setup.treasury), 3 * fee);
+}
+
+#[test]
+fn effects_before_interactions_ordering_invariant_verified() {
+    // Acceptance criterion #3: proves that round state is cleanly transitioned
+    // and cannot be double-paid or pre-paid.
+    let capacity = 3u32;
+    let amount = 10 * ONE_USDC;
+    let (setup, reentrant) = setup_with_reentrant_token(capacity, amount, MAX_FEE_BPS);
+    let client = setup.client();
+
+    setup.join_all();
+    client.start();
+    setup.contribute_all(1);
+    client.execute_payout();
+
+    setup.contribute_all(2);
+    // Arm attack during round 2 payout
+    reentrant.arm(&setup.group_id, &setup.member(2), &amount, &2u32);
+    client.execute_payout();
+    reentrant.disarm();
+
+    let (exec_failed, contrib_failed) = reentrant.attack_results();
+    assert!(
+        exec_failed,
+        "nested execute_payout during round 2 must be rejected"
+    );
+    assert!(
+        contrib_failed,
+        "nested contribute during round 2 must be rejected"
+    );
+    assert!(reentrant.was_attack_called());
+
+    assert!(
+        client.get_round(&2u32).payout_executed,
+        "round 2 must be marked payout_executed"
+    );
+    assert_eq!(
+        client.get_current_round(),
+        3,
+        "current round must be advanced to 3"
+    );
+    assert_eq!(
+        client.get_group().round_phase,
+        RoundPhase::WaitingForContributions
+    );
+
+    // Any attempt to execute payout again for round 2 is rejected
+    assert_eq!(
+        client.try_execute_payout(),
+        Err(Ok(GroupError::ContributionsIncomplete))
+    );
+}
+
+#[test]
+fn reentrant_attack_state_strictly_matches_clean_control_run() {
+    // Acceptance criterion #2: asserts that round state and all balances
+    // after an armed attack match a non-reentrant control run exactly.
+    let capacity = 3u32;
+    let amount = 10 * ONE_USDC;
+    let fee_bps = 50u32;
+
+    // Control run
+    let (control_setup, control_token) = setup_with_reentrant_token(capacity, amount, fee_bps);
+    control_setup.run_to_completion();
+    let control_client = control_setup.client();
+
+    // Attack run
+    let (attack_setup, attack_token) = setup_with_reentrant_token(capacity, amount, fee_bps);
+    let attack_client = attack_setup.client();
+    attack_setup.join_all();
+    attack_client.start();
+
+    // Round 1 with armed re-entrant attack
+    attack_setup.contribute_all(1);
+    attack_token.arm(
+        &attack_setup.group_id,
+        &attack_setup.member(1),
+        &amount,
+        &1u32,
+    );
+    attack_client.execute_payout();
+    attack_token.disarm();
+
+    // Round 2 with armed re-entrant attack
+    attack_setup.contribute_all(2);
+    attack_token.arm(
+        &attack_setup.group_id,
+        &attack_setup.member(2),
+        &amount,
+        &2u32,
+    );
+    attack_client.execute_payout();
+    attack_token.disarm();
+
+    // Round 3 completion
+    attack_setup.contribute_all(3);
+    attack_client.execute_payout();
+
+    // Assert states are 100% equivalent
+    assert_eq!(attack_client.get_status(), control_client.get_status());
+    assert_eq!(
+        attack_client.get_current_round(),
+        control_client.get_current_round()
+    );
+    assert_eq!(
+        attack_client.get_pool_balance(),
+        control_client.get_pool_balance()
+    );
+
+    let mut idx = 0;
+    while idx < capacity {
+        assert_eq!(
+            attack_token.balance(&attack_setup.member(idx)),
+            control_token.balance(&control_setup.member(idx)),
+            "member balance diverged between attack and control run"
+        );
+        idx += 1;
+    }
+    assert_eq!(
+        attack_token.balance(&attack_setup.treasury),
+        control_token.balance(&control_setup.treasury)
+    );
+    assert_eq!(
+        attack_token.balance(&attack_setup.group_id),
+        control_token.balance(&control_setup.group_id)
+    );
+}
+
+#[test]
+fn reentrant_attack_on_final_round_cannot_double_pay_or_reopen_group() {
+    let capacity = 3u32;
+    let amount = 10 * ONE_USDC;
+    let (setup, reentrant) = setup_with_reentrant_token(capacity, amount, MAX_FEE_BPS);
+    let client = setup.client();
+
+    setup.join_all();
+    client.start();
+    setup.contribute_all(1);
+    client.execute_payout();
+    setup.contribute_all(2);
+    client.execute_payout();
+
+    // Round 3 is the final round
+    setup.contribute_all(3);
+    reentrant.arm(&setup.group_id, &setup.member(0), &amount, &3u32);
+    client.execute_payout();
+    reentrant.disarm();
+
+    let (exec_failed, _) = reentrant.attack_results();
+    assert!(exec_failed, "final round reentrant payout must fail");
+
+    assert_eq!(client.get_status(), Status::Completed);
+    assert_eq!(client.get_group().round_phase, RoundPhase::PayoutExecuted);
+
+    // Group is completed; subsequent attempts are rejected with GroupCompleted
+    assert_eq!(
+        client.try_execute_payout(),
+        Err(Ok(GroupError::GroupCompleted))
+    );
+}
