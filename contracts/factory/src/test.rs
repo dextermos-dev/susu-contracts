@@ -37,7 +37,27 @@ fn setup(fee_bps: u32) -> (Env, Address, Address, FactoryContractClient<'static>
 
 #[test]
 fn constructor_stores_configuration() {
-    let (_, admin, treasury, client) = setup(MAX_FEE_BPS);
+    let (env, admin, treasury, client) = setup(MAX_FEE_BPS);
+
+    // The constructor is the only invocation so far, so `events().all()` is exactly
+    // what it published. Capture events before subsequent client calls.
+    let emitted = env.events().all().filter_by_contract(&client.address);
+    let expected = FactoryInitialized {
+        admin: admin.clone(),
+        treasury: treasury.clone(),
+        fee_bps: MAX_FEE_BPS,
+        group_wasm_hash: BytesN::from_array(&env, &[7u8; 32]),
+    }
+    .to_xdr(&env, &client.address);
+    assert_eq!(
+        emitted
+            .events()
+            .iter()
+            .filter(|event| **event == expected)
+            .count(),
+        1,
+        "the constructor must publish exactly one FactoryInitialized event"
+    );
 
     let config = client.get_config();
     assert_eq!(config.admin, admin);
@@ -46,6 +66,40 @@ fn constructor_stores_configuration() {
     assert!(!config.paused, "a new Factory is not paused");
     assert_eq!(client.get_group_count(), 0);
     assert_eq!(client.version(), 3);
+}
+
+#[test]
+fn constructor_publishes_initial_configuration_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let wasm_hash = BytesN::from_array(&env, &[42u8; 32]);
+    let fee_bps = 25u32;
+
+    let factory_id = env.register(
+        FactoryContract,
+        (admin.clone(), wasm_hash.clone(), treasury.clone(), fee_bps),
+    );
+
+    let emitted = env.events().all().filter_by_contract(&factory_id);
+    let expected = FactoryInitialized {
+        admin,
+        treasury,
+        fee_bps,
+        group_wasm_hash: wasm_hash,
+    }
+    .to_xdr(&env, &factory_id);
+
+    assert_eq!(
+        emitted
+            .events()
+            .iter()
+            .filter(|event| **event == expected)
+            .count(),
+        1,
+        "deployment must emit a matching FactoryInitialized event"
+    );
 }
 
 #[test]
